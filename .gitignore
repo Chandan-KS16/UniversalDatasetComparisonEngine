@@ -1,0 +1,25 @@
+# Python cache / build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+
+# Virtual environment
+venv/
+
+# VS Code settings
+.vscode/
+
+# Logs
+*.log
+
+# Project runtime artifacts
+uploads/
+reports/
+
+# Backup / temp files
+*.bak
+*.swp
