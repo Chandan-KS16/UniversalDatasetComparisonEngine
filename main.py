@@ -184,9 +184,27 @@ def compare(request: CompareRequest):
 
 
     # Schema comparison
+    # ---------- SCHEMA COMPARISON WITH NULLABILITY OPTIONS ----------
     try:
-        schema_a = adapter_a.get_schema()
-        schema_b = adapter_b.get_schema()
+        # options: {"check_nullability": "none"|"sample"|"stream"}
+        check_nulls = (request.options or {}).get("check_nullability", "sample")
+
+        def _get_schema(adapter):
+            if check_nulls == "none":
+                # no null inference, just dtype sample
+                raw = adapter.get_schema(stream_infer_nulls=False)
+                # override all nullables as False (ignore nullability)
+                for col in raw["columns"]:
+                    col["nullable"] = False
+                return raw
+            elif check_nulls == "stream":
+                return adapter.get_schema(stream_infer_nulls=True)
+            else:  # "sample" or fallback
+                return adapter.get_schema(stream_infer_nulls=False)
+
+        schema_a = _get_schema(adapter_a)
+        schema_b = _get_schema(adapter_b)
+
         schema_report = compare_schemas(
             schema_a, schema_b,
             source_a=request.dataset_a.source_type,
@@ -195,6 +213,8 @@ def compare(request: CompareRequest):
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Schema comparison failed: {e}")
+# ---------- END SCHEMA COMPARISON ----------
+
 
     # ---------- PRIMARY KEY VALIDATION (conservative) ----------
     # normalize primary_key to a list (supports string or list)
@@ -339,7 +359,8 @@ def compare(request: CompareRequest):
 async def compare_files(
     dataset_a: UploadFile = File(...),
     dataset_b: UploadFile = File(...),
-    primary_key: Optional[str] = Form(None)  # accepts 'CustomerID' or '["CustomerID"]' or 'id1,id2'
+    primary_key: Optional[str] = Form(None),  # accepts 'CustomerID' or '["CustomerID"]' or 'id1,id2'
+    check_nullability: Optional[str] = Form("sample")  # "none" | "sample" | "stream"
 ):
     """
     Accept two uploaded files and forward them into the canonical compare pipeline.
@@ -364,7 +385,7 @@ async def compare_files(
         if isinstance(primary_key, str) and primary_key.strip() in placeholder_values:
             raise HTTPException(
                 status_code=400,
-                detail="primary_key appears to be a placeholder. Provide a real column name (e.e.g. CustomerID) or leave blank."
+                detail="primary_key appears to be a placeholder. Provide a real column name (e.g. CustomerID) or leave blank."
             )
 
         # try JSON first (e.g. '["CustomerID"]' or '"CustomerID"')
@@ -389,11 +410,20 @@ async def compare_files(
     # Ensure pk is usable (auto-add Id if missing)
     path_a, path_b, pk_list = ensure_pk(path_a, path_b, pk_list)
 
+    # ----- validate nullability option -----
+    allowed_null_opts = {"none", "sample", "stream"}
+    if check_nullability not in allowed_null_opts:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid check_nullability value '{check_nullability}'. Allowed: {sorted(allowed_null_opts)}"
+        )
+
+    # Build CompareRequest with options
     req = CompareRequest(
         dataset_a=DataSourceConfig(source_type="file", config={"path": path_a}),
         dataset_b=DataSourceConfig(source_type="file", config={"path": path_b}),
         primary_key=pk_list,
-        options={}
+        options={"check_nullability": check_nullability}
     )
 
     try:
