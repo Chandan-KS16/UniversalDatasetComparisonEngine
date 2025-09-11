@@ -1,0 +1,18 @@
+fastapi
+uvicorn[standard]
+polars
+sqlalchemy
+psycopg2-binary
+pyarrow
+xxhash
+jinja2
+python-dotenv
+python-multipart
+
+# Cloud & storage backends
+fsspec
+s3fs
+gcsfs
+adlfs
+azure-storage-blob
+boto3
