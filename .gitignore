@@ -23,3 +23,6 @@ reports/
 # Backup / temp files
 *.bak
 *.swp
+
+#environment files
+.env
