@@ -48,11 +48,10 @@ def adapter_factory(config: Dict[str, Any]) -> DataSourceAdapter:
       legacy:    {"source_type":"cloud","path":"s3://bucket/key"}
     """
     
-        # normalize config key for backward compatibility
+    # normalize config key for backward compatibility
     if "source_type" in config and "type" not in config:
         config["type"] = config["source_type"]
 
-        
     if not isinstance(config, dict):
         raise ValueError("adapter_factory: config must be a dict")
 
@@ -96,10 +95,12 @@ def adapter_factory(config: Dict[str, Any]) -> DataSourceAdapter:
     
     elif config["type"] == "snowflake":
         from adapters.snowflake_adapter import SnowflakeAdapter
-        adapter = SnowflakeAdapter()
-        adapter.config.update(config.get("config", {}))  # merge runtime config (e.g. table)
-        return adapter
-
+        database = get("database")
+        schema = get("schema")
+        table = get("table")
+        if not database or not schema or not table:
+            raise ValueError("Snowflake config requires 'database', 'schema', and 'table'")
+        return SnowflakeAdapter(database=database, schema=schema, table=table)
 
     else:
         raise ValueError(f"Unsupported source_type: {source_type}")
