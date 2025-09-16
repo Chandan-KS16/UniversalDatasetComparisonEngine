@@ -1,6 +1,7 @@
 # adapters/base.py
 
 from abc import ABC, abstractmethod
+from logging import config
 from typing import Iterator, Dict, Any
 import polars as pl
 
@@ -46,6 +47,12 @@ def adapter_factory(config: Dict[str, Any]) -> DataSourceAdapter:
       canonical: {"source_type":"cloud","config":{"path":"s3://bucket/key"}}
       legacy:    {"source_type":"cloud","path":"s3://bucket/key"}
     """
+    
+        # normalize config key for backward compatibility
+    if "source_type" in config and "type" not in config:
+        config["type"] = config["source_type"]
+
+        
     if not isinstance(config, dict):
         raise ValueError("adapter_factory: config must be a dict")
 
@@ -86,6 +93,13 @@ def adapter_factory(config: Dict[str, Any]) -> DataSourceAdapter:
         if not path:
             raise ValueError("Cloud config requires 'path' (or 'uri'/'url')")
         return CloudAdapter(path=path, encoding=encoding)
+    
+    elif config["type"] == "snowflake":
+        from adapters.snowflake_adapter import SnowflakeAdapter
+        adapter = SnowflakeAdapter()
+        adapter.config.update(config.get("config", {}))  # merge runtime config (e.g. table)
+        return adapter
+
 
     else:
         raise ValueError(f"Unsupported source_type: {source_type}")

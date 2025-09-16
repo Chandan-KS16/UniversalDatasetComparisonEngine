@@ -1,12 +1,16 @@
 import os
 import time
 import uuid
+import decimal
 import json
 import csv
 import traceback
 from typing import Optional, Dict, Any, List
+from dotenv import load_dotenv
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+load_dotenv()
+
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -26,8 +30,24 @@ from compare.value_comparator import compare_values
 # History manager (summaries)
 from report.history_manager import save_history, load_history
 
+
+# Application configuration from environment
+APP_NAME = os.getenv("APP_NAME", "Universal Dataset Comparison Engine")
+APP_VERSION = os.getenv("APP_VERSION", "1.0.0")
+APP_ENV = os.getenv("APP_ENV", "development")
+APP_HOST = os.getenv("APP_HOST", "0.0.0.0")
+APP_PORT = int(os.getenv("APP_PORT", "8000"))
+LOG_LEVEL = os.getenv("LOG_LEVEL", "info")
+
+
+
 # ------------------- FastAPI setup -------------------
-app = FastAPI(title="Universal Dataset Comparison Engine")
+app = FastAPI(
+    title=APP_NAME,
+    version=APP_VERSION,
+    description="A backend for comparing datasets."
+)
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -42,6 +62,13 @@ UPLOADS_DIR = os.path.join(os.getcwd(), "uploads")
 REPORTS_DIR = os.path.join(os.getcwd(), "reports")
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 os.makedirs(REPORTS_DIR, exist_ok=True)
+
+class EnhancedJSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, decimal.Decimal):
+            return str(obj)  # preserve exact precision for history
+        return super().default(obj)
+
 
 # ------------------- Minimal Safe Synthetic ID -------------------
 def ensure_pk(path_a: str, path_b: str, pk_list: Optional[List[str]]):
@@ -336,7 +363,7 @@ def compare(request: CompareRequest):
     report_path = os.path.join(REPORTS_DIR, f"report_{job_id}.json")
     try:
         with open(report_path, "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2)
+            json.dump(report, f, indent=2, cls=EnhancedJSONEncoder)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save report: {e}")
 
@@ -357,15 +384,24 @@ def compare(request: CompareRequest):
 
 @app.post("/compare/files")
 async def compare_files(
-    dataset_a: UploadFile = File(...),
-    dataset_b: UploadFile = File(...),
-    primary_key: Optional[str] = Form(None),  # accepts 'CustomerID' or '["CustomerID"]' or 'id1,id2'
-    check_nullability: Optional[str] = Form("sample")  # "none" | "sample" | "stream"
+    dataset_a: UploadFile | None = File(None),
+    dataset_b: UploadFile | None = File(None),
+    dataset_a_source_type: Optional[str] = Form("file"),
+    dataset_a_table: Optional[str] = Form(None),
+    dataset_a_schema: Optional[str] = Form(None),      # schema param
+    dataset_a_database: Optional[str] = Form(None),    # NEW database param
+    dataset_b_source_type: Optional[str] = Form("file"),
+    dataset_b_table: Optional[str] = Form(None),
+    dataset_b_schema: Optional[str] = Form(None),      # schema param
+    dataset_b_database: Optional[str] = Form(None),    # NEW database param
+    primary_key: Optional[str] = Form(None),
+    check_nullability: Optional[str] = Form("sample")
 ):
     """
-    Accept two uploaded files and forward them into the canonical compare pipeline.
+    Accept two datasets (file or DB) and forward them into the canonical compare pipeline.
     Saves files to uploads/, builds CompareRequest, and calls existing compare().
     """
+
     async def _save(upload: UploadFile) -> str:
         safe_name = f"{int(time.time())}_{uuid.uuid4().hex}_{os.path.basename(upload.filename or 'upload')}"
         dest = os.path.join(UPLOADS_DIR, safe_name)
@@ -374,21 +410,43 @@ async def compare_files(
             f.write(contents)
         return dest
 
-    path_a = await _save(dataset_a)
-    path_b = await _save(dataset_b)
+    # ----- Build dataset A config -----
+    if dataset_a:
+        path_a = await _save(dataset_a)
+        config_a = {"source_type": "file", "config": {"path": path_a}}
+    else:
+        config_a = {
+            "source_type": dataset_a_source_type,
+            "config": {
+                "table": dataset_a_table,
+                "schema": dataset_a_schema,        # schema optional, adapter falls back to env
+                "database": dataset_a_database     # NEW database optional, adapter falls back to env
+            }
+        }
 
-    # ----- replace primary_key parsing in /compare/files with placeholder rejection -----
+    # ----- Build dataset B config -----
+    if dataset_b:
+        path_b = await _save(dataset_b)
+        config_b = {"source_type": "file", "config": {"path": path_b}}
+    else:
+        config_b = {
+            "source_type": dataset_b_source_type,
+            "config": {
+                "table": dataset_b_table,
+                "schema": dataset_b_schema,        # schema optional, adapter falls back to env
+                "database": dataset_b_database     # NEW database optional, adapter falls back to env
+            }
+        }
+
+    # ----- primary_key parsing -----
     pk_list = None
     if primary_key:
-        # quick check for obvious placeholder strings (raw input)
         placeholder_values = {"string", "String", "<string>", "<primary_key>", "<pk>", "primary_key"}
-        if isinstance(primary_key, str) and primary_key.strip() in placeholder_values:
+        if primary_key.strip() in placeholder_values:
             raise HTTPException(
                 status_code=400,
                 detail="primary_key appears to be a placeholder. Provide a real column name (e.g. CustomerID) or leave blank."
             )
-
-        # try JSON first (e.g. '["CustomerID"]' or '"CustomerID"')
         try:
             parsed = json.loads(primary_key)
             if isinstance(parsed, list):
@@ -396,19 +454,18 @@ async def compare_files(
             else:
                 pk_list = [str(parsed).strip()] if str(parsed).strip() else None
         except Exception:
-            # fallback: treat as comma-separated list or single name
             pk_list = [p.strip() for p in primary_key.split(",") if p.strip()]
-
-        # final safety: if parsed list contains placeholder values, reject
         if pk_list and any(p in placeholder_values for p in pk_list):
             raise HTTPException(
                 status_code=400,
-                detail="primary_key contains placeholder values (e.g. 'string'). Provide real column name(s) or leave blank."
+                detail="primary_key contains placeholder values. Provide real column name(s) or leave blank."
             )
-    # -------------------------------------------------------------------------------
 
-    # Ensure pk is usable (auto-add Id if missing)
-    path_a, path_b, pk_list = ensure_pk(path_a, path_b, pk_list)
+    # ----- Ensure pk is usable (auto-add Id if missing, only for file↔file) -----
+    if config_a["source_type"] == "file" and config_b["source_type"] == "file":
+        config_a["config"]["path"], config_b["config"]["path"], pk_list = ensure_pk(
+            config_a["config"]["path"], config_b["config"]["path"], pk_list
+        )
 
     # ----- validate nullability option -----
     allowed_null_opts = {"none", "sample", "stream"}
@@ -420,8 +477,8 @@ async def compare_files(
 
     # Build CompareRequest with options
     req = CompareRequest(
-        dataset_a=DataSourceConfig(source_type="file", config={"path": path_a}),
-        dataset_b=DataSourceConfig(source_type="file", config={"path": path_b}),
+        dataset_a=config_a,
+        dataset_b=config_b,
         primary_key=pk_list,
         options={"check_nullability": check_nullability}
     )
@@ -435,7 +492,7 @@ async def compare_files(
         print(tb)
         raise HTTPException(status_code=500, detail={
             "error": str(e),
-            "traceback": tb.splitlines()[-30:]  # last 30 lines of the trace
+            "traceback": tb.splitlines()[-30:]
         })
 
 
@@ -456,3 +513,28 @@ def get_history_entry(job_id: str):
             return json.load(f)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to read report: {e}")
+    
+@app.get("/snowflake/metadata")
+def get_snowflake_metadata(
+    type: str = Query(..., description="databases | schemas | tables"),
+    database: str = None,
+    schema: str = None
+):
+    adapter = SnowflakeAdapter()
+    try:
+        if type == "databases":
+            result = adapter.list_databases()
+        elif type == "schemas":
+            if not database:
+                raise HTTPException(status_code=400, detail="database is required for schemas")
+            result = adapter.list_schemas(database)
+        elif type == "tables":
+            if not database or not schema:
+                raise HTTPException(status_code=400, detail="database and schema are required for tables")
+            result = adapter.list_tables(database, schema)
+        else:
+            raise HTTPException(status_code=400, detail="Invalid type. Use databases | schemas | tables")
+    finally:
+        adapter.close()
+
+    return {type: result}
