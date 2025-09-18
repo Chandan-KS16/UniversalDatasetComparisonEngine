@@ -80,14 +80,25 @@ def compare_datasets(
     adapter_b: DataSourceAdapter,
     pk_cols: Optional[List[str]] = None,
     chunk_size: int = 100_000,
+    pk_map: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """
     Compare two datasets row-by-row using PK or surrogate PK.
+    Supports either a common pk_cols (same in both datasets)
+    or a pk_map with distinct keys per dataset.
     """
 
-    # Build mappings
-    map_a, rows_a = _prepare_pk_and_hash(adapter_a, pk_cols, chunk_size)
-    map_b, rows_b = _prepare_pk_and_hash(adapter_b, pk_cols, chunk_size)
+    if pk_map:
+        # Different PKs for A and B
+        pk_a = [pk_map["a"]]
+        pk_b = [pk_map["b"]]
+
+        map_a, rows_a = _prepare_pk_and_hash(adapter_a, pk_a, chunk_size)
+        map_b, rows_b = _prepare_pk_and_hash(adapter_b, pk_b, chunk_size)
+    else:
+        # Same PK(s) for both datasets (default behaviour)
+        map_a, rows_a = _prepare_pk_and_hash(adapter_a, pk_cols, chunk_size)
+        map_b, rows_b = _prepare_pk_and_hash(adapter_b, pk_cols, chunk_size)
 
     # Compare PK sets
     keys_a = set(map_a.keys())

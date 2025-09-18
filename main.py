@@ -6,6 +6,9 @@ import json
 import csv
 import traceback
 from typing import Optional, Dict, Any, List
+from app.routers import history
+from app.database import Base, engine
+from app.database import SessionLocal
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -28,8 +31,7 @@ from compare.schema_comparator import compare_schemas
 from compare.value_comparator import compare_values
 
 # History manager (summaries)
-from report.history_manager import save_history, load_history
-
+from app.services.history_manager import save_history
 
 # Application configuration from environment
 APP_NAME = os.getenv("APP_NAME", "Universal Dataset Comparison Engine")
@@ -48,6 +50,12 @@ app = FastAPI(
     description="A backend for comparing datasets."
 )
 
+
+# Create tables if not exist
+Base.metadata.create_all(bind=engine)
+
+# Routers
+app.include_router(history.router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -243,7 +251,7 @@ def compare(request: CompareRequest):
 # ---------- END SCHEMA COMPARISON ----------
 
 
-    # ---------- PRIMARY KEY VALIDATION (conservative) ----------
+       # ---------- PRIMARY KEY VALIDATION (enhanced) ----------
     # normalize primary_key to a list (supports string or list)
     pk_list = None
     if request.primary_key:
@@ -259,31 +267,36 @@ def compare(request: CompareRequest):
             except Exception:
                 pk_list = None
 
-    # If primary key is required by your flow, enforce it
-    if not pk_list:
-        raise HTTPException(status_code=400, detail="primary_key is required (provide column name(s) as string or JSON list)")
+    # If neither primary_key nor primary_key_map provided, enforce requirement
+    if not pk_list and not (request.options and request.options.get("pk_map")):
+        raise HTTPException(
+            status_code=400,
+            detail="primary_key or primary_key_map is required"
+        )
 
     # extract column names from schemas (your get_schema returns {"columns":[{"name":...},...]})
     cols_a = [c.get("name") for c in schema_a.get("columns", []) if c.get("name")]
     cols_b = [c.get("name") for c in schema_b.get("columns", []) if c.get("name")]
 
-    missing_in_a = [c for c in pk_list if c not in cols_a]
-    missing_in_b = [c for c in pk_list if c not in cols_b]
+    # Only validate direct PK list (pk_map has its own validation earlier)
+    if pk_list:
+        missing_in_a = [c for c in pk_list if c not in cols_a]
+        missing_in_b = [c for c in pk_list if c not in cols_b]
 
-    if missing_in_a or missing_in_b:
-        # provide helpful sample of available columns (limit to 20 to avoid huge responses)
-        sample_a = cols_a[:20]
-        sample_b = cols_b[:20]
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "msg": "Primary key column(s) not found",
-                "missing_in_a": missing_in_a,
-                "missing_in_b": missing_in_b,
-                "available_a_sample": sample_a,
-                "available_b_sample": sample_b
-            }
-        )
+        if missing_in_a or missing_in_b:
+            # provide helpful sample of available columns (limit to 20 to avoid huge responses)
+            sample_a = cols_a[:20]
+            sample_b = cols_b[:20]
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "msg": "Primary key column(s) not found",
+                    "missing_in_a": missing_in_a,
+                    "missing_in_b": missing_in_b,
+                    "available_a_sample": sample_a,
+                    "available_b_sample": sample_b
+                }
+            )
 
     # pass the normalized pk_list into downstream call
     request.primary_key = pk_list
@@ -367,20 +380,24 @@ def compare(request: CompareRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save report: {e}")
 
-    # Save summary to history.json
-    history_entry = {
-        "job_id": report["job_id"],
-        "timestamp": int(time.time()),  # epoch seconds
-        "dataset_a": report["datasets"]["dataset_a"],
-        "dataset_b": report["datasets"]["dataset_b"],
-        "rows_a": report["summary"]["rows_a"],
-        "rows_b": report["summary"]["rows_b"],
-        "changed_rows": report["summary"]["changed_rows"],
-        "schema_findings": report["summary"]["schema_findings"],
-    }
-    save_history(history_entry)
+        # Persist summary to history (DB-backed)
+    db = SessionLocal()
+    try:
+        save_history(
+            db=db,
+            dataset_a=report["datasets"]["dataset_a"],
+            dataset_b=report["datasets"]["dataset_b"],
+            json_report=json.loads(json.dumps(report, cls=EnhancedJSONEncoder)),
+            markup_report=None,        # replace with generated markup if/when available
+            visual_report=None,        # replace with visual config if/when available
+            tags=["original"]
+        )
+    finally:
+        db.close()
 
-    return report
+
+    return {"result": report, "history_id": record.id}
+
 
 @app.post("/compare/files")
 async def compare_files(
@@ -389,13 +406,14 @@ async def compare_files(
     dataset_a_source_type: Optional[str] = Form("file"),
     dataset_a_table: Optional[str] = Form(None),
     dataset_a_schema: Optional[str] = Form(None),      # schema param
-    dataset_a_database: Optional[str] = Form(None),    # NEW database param
+    dataset_a_database: Optional[str] = Form(None),    # database param
     dataset_b_source_type: Optional[str] = Form("file"),
     dataset_b_table: Optional[str] = Form(None),
     dataset_b_schema: Optional[str] = Form(None),      # schema param
-    dataset_b_database: Optional[str] = Form(None),    # NEW database param
+    dataset_b_database: Optional[str] = Form(None),    # database param
     primary_key: Optional[str] = Form(None),
-    check_nullability: Optional[str] = Form("sample")
+    primary_key_map: Optional[str] = Form(None),       # ✅ NEW param for pk_map
+    check_nullability: Optional[str] = Form("sample"),
 ):
     """
     Accept two datasets (file or DB) and forward them into the canonical compare pipeline.
@@ -462,10 +480,16 @@ async def compare_files(
             )
 
     # ----- Ensure pk is usable (auto-add Id if missing, only for file↔file) -----
-    if config_a["source_type"] == "file" and config_b["source_type"] == "file":
+    if (
+        config_a["source_type"] == "file"
+        and config_b["source_type"] == "file"
+        and not pk_list
+        and not primary_key_map
+    ):
         config_a["config"]["path"], config_b["config"]["path"], pk_list = ensure_pk(
             config_a["config"]["path"], config_b["config"]["path"], pk_list
         )
+
 
     # ----- validate nullability option -----
     allowed_null_opts = {"none", "sample", "stream"}
@@ -476,16 +500,41 @@ async def compare_files(
         )
 
     # Build CompareRequest with options
+    options = {"check_nullability": check_nullability}
+
+    # Forward primary_key_map if provided
+    if primary_key_map:
+        try:
+            options["pk_map"] = json.loads(primary_key_map)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid primary_key_map format: {e}"
+            )
+
     req = CompareRequest(
         dataset_a=config_a,
         dataset_b=config_b,
         primary_key=pk_list,
-        options={"check_nullability": check_nullability}
+        options=options
     )
-
     try:
         result = compare(req)
-        return result
+
+        # --- NEW: save history ---
+        from app.services import history_manager
+        from sqlalchemy.orm import Session
+        from app.database import get_db
+
+        db: Session = next(get_db())
+        record = history_manager.save_history(
+            db=db,
+            dataset_a=config_a,
+            dataset_b=config_b,
+            json_report=result,
+        )
+
+        return {"result": result, "history_id": record.id}
     except Exception as e:
         tb = traceback.format_exc()
         print("COMPARE FILES ERROR:", e)
@@ -495,25 +544,7 @@ async def compare_files(
             "traceback": tb.splitlines()[-30:]
         })
 
-
-@app.get("/history")
-def get_history():
-    """Return list of past comparison summaries."""
-    return load_history()
-
-
-@app.get("/history/{job_id}")
-def get_history_entry(job_id: str):
-    """Return the full detailed report for a given job_id."""
-    report_path = os.path.join(REPORTS_DIR, f"report_{job_id}.json")
-    if not os.path.exists(report_path):
-        raise HTTPException(status_code=404, detail="Report not found")
-    try:
-        with open(report_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to read report: {e}")
-    
+# ------------------- Snowflake Metadata Endpoint -------------------
 @app.get("/snowflake/metadata")
 def get_snowflake_metadata(
     type: str = Query(..., description="databases | schemas | tables"),
